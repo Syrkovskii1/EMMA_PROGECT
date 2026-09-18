@@ -1,0 +1,12 @@
+start
+/load_test
+/up_to_play
+/mega;/head_rot;random
+/mega;/tilt;forward
+/mega;/turn;200;0
+/sn;2;0
+/p;500
+/bow;0;1300;100
+/yes
+/end
+/play      

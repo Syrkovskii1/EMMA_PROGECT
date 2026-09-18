@@ -1,0 +1,11 @@
+chill
+/load_test
+/mega;/head_rot;random
+/mega;/tilt;forward
+/sn;2;0
+/bow;0;1300;100
+/dyn_press;0
+/bow;1;700;100
+/down_to_play
+/end
+/play      

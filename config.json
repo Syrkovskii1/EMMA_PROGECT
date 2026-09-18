@@ -1,0 +1,11 @@
+{
+    "stt": {
+        "model": "large-v3",
+        "device": "cuda",
+        "compute_type": "float16"
+    },
+    "nlp": {
+        "model": "all-MiniLM-L6-v2",
+        "device": "cuda"
+    }
+}
