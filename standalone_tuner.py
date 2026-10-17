@@ -4,6 +4,8 @@
 import math
 import queue
 import time
+import socket
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from dataclasses import dataclass
@@ -299,9 +301,9 @@ class MpmPitchDetector:
 class StandaloneTunerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Тюнер EMMA (McLeod Pitch Method & Scenario Generator)")
-        self.root.geometry("660x920")
-        self.root.minsize(560, 740)
+        self.root.title("Тюнер EMMA (Авто-генерация и ручное управление)")
+        self.root.geometry("680x960")
+        self.root.minsize(580, 780)
         self.root.configure(bg="#f6f7f9")
 
         # Переменные аудио
@@ -321,33 +323,32 @@ class StandaloneTunerApp:
         self.min_freq_var = tk.DoubleVar(value=150.0)
         self.max_freq_var = tk.DoubleVar(value=4000.0)
 
-        # Фильтры стабильности ноты
-        self.confirm_frames_var = tk.IntVar(value=3)
-        self.smoothing_frames_var = tk.IntVar(value=3)
-        self.min_duration_ms_var = tk.IntVar(value=80)
+        # Сегментация нот (офлайн-анализ записанного фрагмента целиком)
+        self.min_bow_gap_ms_var = tk.IntVar(value=20)   # мин. пауза между сменами смычка (Снижено для лучшего отклика)
+        self.min_duration_ms_var = tk.IntVar(value=60)  # мин. длительность сегмента звука 
 
-        # Авто-стоп по тишине
+        # Авто-стоп по тишине (завершает ВСЮ сессию записи, не отдельную ноту)
         self.silence_stop_sec_var = tk.DoubleVar(value=3.0)
         self.silence_start_time: float | None = None
 
         # Состояние сессии записи
         self.is_recording_session = False
         self.rec_status_var = tk.StringVar(value="Запись не ведется. Нажмите 'Старт записи'")
-        self.recorded_events: list[tuple[int, int]] = []  # Хранит пары (midi_note, duration_ms)
+        self.recorded_events: list[tuple[int, int]] = []
+
+        # Сырой звук всей сессии — копится во время записи, разбирается на ноты после стопа
+        self.session_audio_chunks: list[np.ndarray] = []
+        self.session_sample_rate: int = 48000
 
         # Дисплей тюнера
         self.live_note_var = tk.StringVar(value="--")
         self.live_hz_var = tk.StringVar(value="-- Hz")
         self.dev_text_var = tk.StringVar(value="Отклонение: 0 цент.")
-
-        # Буферы трекинга нот
-        self.current_midi: int | None = None
-        self.note_start_time: float = 0.0
-        self.pitch_buffer: list[int] = []
-        self.candidate_midi: int | None = None
-        self.candidate_count: int = 0
-        self.candidate_start_time: float = 0.0
-        self.silent_ticks = 0
+        
+        # История ручных команд
+        self.manual_cmd_var = tk.StringVar()
+        self.command_history: list[str] = []
+        self.history_index = -1
 
         self._build_styles()
         self._build_ui()
@@ -378,33 +379,28 @@ class StandaloneTunerApp:
         settings_frame.columnconfigure(1, weight=1)
         settings_frame.columnconfigure(3, weight=1)
 
-        # Ряд 0: Вход
         ttk.Label(settings_frame, text="Вход:").grid(row=0, column=0, sticky="w", pady=2)
         self.device_combo = ttk.Combobox(settings_frame, textvariable=self.device_var, state="readonly", font=("Segoe UI", 9))
         self.device_combo.grid(row=0, column=1, columnspan=3, sticky="ew", pady=2)
 
-        # Ряд 1: Окно и Чанк
         ttk.Label(settings_frame, text="Окно (samples):").grid(row=1, column=0, sticky="w", pady=2)
         ttk.Combobox(settings_frame, textvariable=self.buffer_size_var, values=[2048, 4096, 8192, 16384], state="readonly", width=8).grid(row=1, column=1, sticky="w", pady=2)
 
         ttk.Label(settings_frame, text="Чанк (block):").grid(row=1, column=2, sticky="w", pady=2, padx=(10, 0))
         ttk.Combobox(settings_frame, textvariable=self.block_size_var, values=[256, 512, 1024], state="readonly", width=8).grid(row=1, column=3, sticky="w", pady=2)
 
-        # Ряд 2: Clarity и Cutoff K
         ttk.Label(settings_frame, text="Порог (Clarity):").grid(row=2, column=0, sticky="w", pady=2)
         ttk.Spinbox(settings_frame, from_=0.1, to=0.9, increment=0.05, textvariable=self.clarity_var, width=8).grid(row=2, column=1, sticky="w", pady=2)
 
         ttk.Label(settings_frame, text="Коэф. октавы K:").grid(row=2, column=2, sticky="w", pady=2, padx=(10, 0))
         ttk.Spinbox(settings_frame, from_=0.5, to=0.98, increment=0.02, textvariable=self.cutoff_k_var, width=8).grid(row=2, column=3, sticky="w", pady=2)
 
-        # Ряд 3: Фильтры стабильности
-        ttk.Label(settings_frame, text="Стабильность (кадр):").grid(row=3, column=0, sticky="w", pady=2)
-        ttk.Spinbox(settings_frame, from_=1, to=10, increment=1, textvariable=self.confirm_frames_var, width=8).grid(row=3, column=1, sticky="w", pady=2)
+        ttk.Label(settings_frame, text="Пауза смычка (мс):").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Spinbox(settings_frame, from_=10, to=200, increment=5, textvariable=self.min_bow_gap_ms_var, width=8).grid(row=3, column=1, sticky="w", pady=2)
 
-        ttk.Label(settings_frame, text="Мин. время (мс):").grid(row=3, column=2, sticky="w", pady=2, padx=(10, 0))
+        ttk.Label(settings_frame, text="Мин. время ноты (мс):").grid(row=3, column=2, sticky="w", pady=2, padx=(10, 0))
         ttk.Spinbox(settings_frame, from_=20, to=500, increment=20, textvariable=self.min_duration_ms_var, width=8).grid(row=3, column=3, sticky="w", pady=2)
 
-        # Ряд 4: Настройка авто-стопа по тишине и A4
         ttk.Label(settings_frame, text="Авто-стоп тишины (с):").grid(row=4, column=0, sticky="w", pady=2)
         ttk.Spinbox(settings_frame, from_=1.0, to=10.0, increment=0.5, textvariable=self.silence_stop_sec_var, width=8).grid(row=4, column=1, sticky="w", pady=2)
 
@@ -445,27 +441,106 @@ class StandaloneTunerApp:
         self.btn_stop_rec.pack(side="left", padx=(0, 6))
         self.btn_stop_rec.state(["disabled"])
 
-        # КНОПКА ПРЕОБРАЗОВАНИЯ В СЦЕНАРИЙ EMMA
-        self.btn_convert = ttk.Button(rec_ctrl_bar, text="⚡ Сценарий EMMA", command=self.convert_to_scenario, style="Convert.TButton")
+        self.btn_convert = ttk.Button(rec_ctrl_bar, text="⚡ Отправить повторно", command=self.convert_to_scenario, style="Convert.TButton")
         self.btn_convert.pack(side="left", padx=(6, 0))
 
-        ttk.Button(rec_ctrl_bar, text="Сохранить в .txt", command=self.save_to_file, style="Secondary.TButton").pack(side="right")
+        ttk.Label(rec_ctrl_bar, text="Сеть (IP:Port):", background="#ffffff").pack(side="left", padx=(10, 2))
+        self.network_target_var = tk.StringVar(value="172.27.101.1:9000")
+        ttk.Entry(rec_ctrl_bar, textvariable=self.network_target_var, width=15).pack(side="left")
+
         ttk.Button(rec_ctrl_bar, text="Очистить", command=self.clear_log, style="Secondary.TButton").pack(side="right", padx=(0, 4))
+        
+        # --- НОВАЯ СТРОКА РУЧНОГО ВВОДА КОМАНД ---
+        manual_frame = ttk.Frame(log_frame)
+        manual_frame.pack(fill="x", pady=(0, 8))
+        
+        ttk.Label(manual_frame, text="Ручная команда:", background="#ffffff").pack(side="left", padx=(0, 5))
+        self.cmd_entry = ttk.Entry(manual_frame, textvariable=self.manual_cmd_var, font=("Cascadia Mono", 10))
+        self.cmd_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        
+        ttk.Button(manual_frame, text="➤ Отправить", command=self.send_manual_command, style="Secondary.TButton").pack(side="right")
+        
+        # Бинды для ручной строки
+        self.cmd_entry.bind("<Return>", lambda e: self.send_manual_command())
+        self.cmd_entry.bind("<Up>", self._on_up_arrow)
+        self.cmd_entry.bind("<Down>", self._on_down_arrow)
 
         # Индикатор статуса записи
         self.status_label = tk.Label(log_frame, textvariable=self.rec_status_var, font=("Segoe UI", 10, "bold"), fg="#66707a", bg="#ffffff", anchor="w", padx=5, pady=5)
         self.status_label.pack(fill="x", pady=(0, 5))
 
         # Текстовое поле для вывода нот и итогового сценария
-        text_container = ttk.Frame(log_frame)
+        text_container = ttk.PanedWindow(log_frame, orient="horizontal")
         text_container.pack(fill="both", expand=True)
 
-        self.log_text = tk.Text(text_container, bg="#fbfcfd", fg="#121417", font=("Cascadia Mono", 11), relief="flat", padx=10, pady=10)
-        self.log_text.pack(side="left", fill="both", expand=True)
+        # Левая панель: ноты
+        notes_frame = ttk.Frame(text_container)
+        text_container.add(notes_frame, weight=1)
+        ttk.Label(notes_frame, text="Записанные ноты:", background="#ffffff").pack(anchor="w")
+        
+        self.notes_text = tk.Text(notes_frame, bg="#fbfcfd", fg="#121417", font=("Cascadia Mono", 11), relief="flat", padx=10, pady=10)
+        self.notes_text.pack(side="left", fill="both", expand=True)
+        notes_scroll = ttk.Scrollbar(notes_frame, orient="vertical", command=self.notes_text.yview)
+        notes_scroll.pack(side="right", fill="y")
+        self.notes_text.configure(yscrollcommand=notes_scroll.set)
 
-        scroll = ttk.Scrollbar(text_container, orient="vertical", command=self.log_text.yview)
-        scroll.pack(side="right", fill="y")
-        self.log_text.configure(yscrollcommand=scroll.set)
+        # Правая панель: команды
+        commands_frame = ttk.Frame(text_container)
+        text_container.add(commands_frame, weight=1)
+        ttk.Label(commands_frame, text="Команды EMMA:", background="#ffffff").pack(anchor="w")
+
+        self.commands_text = tk.Text(commands_frame, bg="#fbfcfd", fg="#121417", font=("Cascadia Mono", 11), relief="flat", padx=10, pady=10)
+        self.commands_text.pack(side="left", fill="both", expand=True)
+        commands_scroll = ttk.Scrollbar(commands_frame, orient="vertical", command=self.commands_text.yview)
+        commands_scroll.pack(side="right", fill="y")
+        self.commands_text.configure(yscrollcommand=commands_scroll.set)
+
+    def _on_up_arrow(self, event) -> None:
+        """Перемещение назад по истории команд (старые команды)."""
+        if self.command_history and self.history_index > 0:
+            self.history_index -= 1
+            self.manual_cmd_var.set(self.command_history[self.history_index])
+            self.cmd_entry.icursor(tk.END)
+
+    def _on_down_arrow(self, event) -> None:
+        """Перемещение вперед по истории команд (к новым или пустому полю)."""
+        if self.command_history and self.history_index < len(self.command_history) - 1:
+            self.history_index += 1
+            self.manual_cmd_var.set(self.command_history[self.history_index])
+            self.cmd_entry.icursor(tk.END)
+        elif self.history_index == len(self.command_history) - 1:
+            self.history_index += 1
+            self.manual_cmd_var.set("")
+
+    def send_manual_command(self) -> None:
+        """Отправка одной ручной команды."""
+        cmd = self.manual_cmd_var.get().strip()
+        if not cmd:
+            return
+            
+        # Добавляем в историю (если не дубликат последней)
+        if not self.command_history or self.command_history[-1] != cmd:
+            self.command_history.append(cmd)
+        
+        # Сбрасываем индекс истории в конец
+        self.history_index = len(self.command_history)
+        self.manual_cmd_var.set("")
+        
+        # Отображаем в текстовом поле
+        self.commands_text.insert(tk.END, f"{cmd}\n")
+        self.commands_text.see(tk.END)
+        
+        # Отправляем по сети
+        target_str = self.network_target_var.get().strip()
+        if ":" in target_str:
+            ip, port_str = target_str.split(":", 1)
+            try:
+                port = int(port_str)
+                self.send_network_scenario(ip, port, f"{cmd}\n")
+            except ValueError:
+                self.rec_status_var.set("❌ Ошибка формата порта")
+        else:
+            self.rec_status_var.set("❌ Ошибка формата IP:Port")
 
     def populate_audio_devices(self) -> None:
         try:
@@ -522,16 +597,14 @@ class StandaloneTunerApp:
             messagebox.showerror("Ошибка аудио", f"Не удалось настроить аудио:\n{exc}")
 
     def _reset_recording_buffers(self) -> None:
-        self.pitch_buffer.clear()
-        self.candidate_midi = None
-        self.candidate_count = 0
-        self.current_midi = None
+        self.session_audio_chunks = []
         self.silence_start_time = None
 
     def start_recording(self) -> None:
-        """Запуск сессии записи нот."""
+        """Запуск сессии записи: очищаем буфер сырого звука и начинаем копить фрагмент целиком."""
         self._reset_recording_buffers()
         self.recorded_events.clear()
+        self.session_sample_rate = self.sample_rate
         self.is_recording_session = True
         self.silence_start_time = time.time()
 
@@ -542,27 +615,199 @@ class StandaloneTunerApp:
         self.rec_status_var.set("🔴 ИДЕТ ЗАПИСЬ | Играйте! (Авто-стоп при тишине)")
 
     def stop_recording_session(self, reason: str = "Остановлено") -> None:
-        """Завершение сессии записи нот."""
+        """Завершение сессии записи: склеиваем записанный фрагмент целиком и только теперь разбираем его на ноты."""
         if not self.is_recording_session:
             return
 
-        self._finalize_current_note(time.time())
         self.is_recording_session = False
         self.silence_start_time = None
 
         self.btn_start_rec.state(["!disabled"])
         self.btn_stop_rec.state(["disabled"])
-
         self.status_label.configure(fg="#66707a")
-        self.rec_status_var.set(f"Запись завершена ({reason}). Готово к конвертации!")
+
+        if self.session_audio_chunks:
+            full_audio = np.concatenate(self.session_audio_chunks)
+        else:
+            full_audio = np.zeros(0, dtype=np.float32)
+        self.session_audio_chunks = []
+
+        duration_sec = len(full_audio) / self.session_sample_rate if self.session_sample_rate else 0.0
+        self.rec_status_var.set(f"⏳ Анализ записанного фрагмента ({duration_sec:.1f} сек)...")
+        self.root.update_idletasks()
+
+        self.recorded_events = self._analyze_recorded_session(full_audio, self.session_sample_rate)
+
+        self.notes_text.delete(1.0, tk.END)
+        for midi_val, note_duration_ms in self.recorded_events:
+            note_name = midi_to_name(midi_val)
+            line = f"Нота: {note_name:<5} | Длительность: {note_duration_ms} мс\n"
+            self.notes_text.insert(tk.END, line)
+        self.notes_text.see(tk.END)
+
+        self.rec_status_var.set(f"✅ {reason} | Найдено нот: {len(self.recorded_events)}")
+
+        # АВТОМАТИЧЕСКИЙ ВЫЗОВ создания и отправки сценария
+        self.convert_to_scenario()
+
+    def _find_bow_segments(self, samples: np.ndarray, sample_rate: int) -> list[tuple[int, int]]:
+        """
+        Ищет сегменты звучания смычка по RMS-огибающей записанного фрагмента.
+        Обновленный алгоритм: отслеживает не только глобальную тишину, но и 
+        локальные провалы амплитуды (dip) для фиксации быстрой смены смычка.
+        """
+        frame_len = max(64, int(sample_rate * 0.010))  # 10 мс окно RMS
+        hop_len = max(32, int(sample_rate * 0.002))    # 2 мс шаг для микро-пауз
+        n = len(samples)
+        if n < frame_len:
+            return []
+
+        n_frames = 1 + (n - frame_len) // hop_len
+        s64 = samples.astype(np.float64)
+        rms = np.empty(n_frames, dtype=np.float64)
+        for i in range(n_frames):
+            s = i * hop_len
+            frame = s64[s:s + frame_len]
+            rms[i] = math.sqrt(float(np.mean(frame * frame)))
+
+        # Сглаживание скользящим средним
+        kernel = np.ones(3) / 3.0
+        rms = np.convolve(rms, kernel, mode='same')
+
+        noise_floor = float(np.percentile(rms, 5))
+        peak = float(np.percentile(rms, 95))
+        span = max(peak - noise_floor, 1e-9)
+        
+        enter_threshold = noise_floor + 0.20 * span
+        exit_threshold = noise_floor + 0.12 * span 
+
+        hop_ms = hop_len / sample_rate * 1000.0
+        min_gap_frames = max(1, int(round(self.min_bow_gap_ms_var.get() / hop_ms)))
+        min_duration_ms = self.min_duration_ms_var.get()
+
+        raw_segments: list[tuple[int, int]] = []
+        in_sound = False
+        seg_start_frame = 0
+        below_run = 0
+        current_note_peak = 0.0
+
+        def close_segment(end_frame: int) -> None:
+            start_sample = seg_start_frame * hop_len
+            end_sample = min(n, end_frame * hop_len + frame_len)
+            seg_duration_ms = (end_sample - start_sample) / sample_rate * 1000.0
+            if seg_duration_ms >= min_duration_ms:
+                raw_segments.append((start_sample, end_sample))
+
+        for i, level in enumerate(rms):
+            if not in_sound:
+                if level >= enter_threshold:
+                    in_sound = True
+                    seg_start_frame = i
+                    below_run = 0
+                    current_note_peak = level
+            else:
+                current_note_peak = max(current_note_peak, level)
+                
+                is_silence = level < exit_threshold
+                is_bow_change_dip = level < (current_note_peak * 0.40)  # Спад на 60% от пика
+                
+                if is_silence or is_bow_change_dip:
+                    below_run += 1
+                    if below_run >= min_gap_frames:
+                        close_segment(i - below_run + 1)
+                        in_sound = False
+                        below_run = 0
+                else:
+                    below_run = 0
+
+        if in_sound:
+            close_segment(n_frames)
+
+        return raw_segments
+
+    def _detect_segment_pitch(self, samples: np.ndarray, seg_start: int, seg_end: int) -> int | None:
+        """Определяет MIDI-номер ноты внутри одного сегмента смычка.
+
+        Скользит несколькими окнами MPM по сегменту (пропуская атаку смычка в начале, если
+        сегмент достаточно длинный) и берёт самый частый результат — так один случайный
+        всплеск/провал внутри сегмента не портит итоговую ноту.
+        """
+        if self.detector is None:
+            return None
+
+        sample_rate = self.detector.sample_rate
+        window = 4096
+        hop = 1024
+        seg_len = seg_end - seg_start
+        if seg_len < 1024:
+            return None
+
+        attack_skip = int(sample_rate * 0.02)  # 20 мс переходного процесса атаки смычка
+        analysis_start = seg_start + attack_skip if seg_len > window + attack_skip else seg_start
+
+        midi_votes: list[int] = []
+        pos = analysis_start
+        while pos + window <= seg_end:
+            chunk = samples[pos:pos + window]
+            result = self.detector.detect(chunk)
+            if result is not None:
+                midi_votes.append(int(round(69.0 + 12.0 * math.log2(result.frequency / self.detector.a4))))
+            pos += hop
+
+        if not midi_votes:
+            # Сегмент короче полного окна анализа — пробуем то, что есть, целиком.
+            chunk = samples[seg_start:seg_end]
+            if len(chunk) >= 1024:
+                result = self.detector.detect(chunk)
+                if result is not None:
+                    return int(round(69.0 + 12.0 * math.log2(result.frequency / self.detector.a4)))
+            return None
+
+        values, counts = np.unique(midi_votes, return_counts=True)
+        return int(values[np.argmax(counts)])
+
+    def _analyze_recorded_session(self, samples: np.ndarray, sample_rate: int) -> list[tuple[int, int]]:
+        """Разбирает записанный фрагмент целиком на отдельные ноты (по одной на каждое движение смычка)."""
+        if len(samples) == 0 or self.detector is None:
+            return []
+
+        segments = self._find_bow_segments(samples, sample_rate)
+        events: list[tuple[int, int]] = []
+        for start_sample, end_sample in segments:
+            midi = self._detect_segment_pitch(samples, start_sample, end_sample)
+            if midi is None:
+                continue
+            duration_ms = int(round((end_sample - start_sample) / sample_rate * 1000.0))
+            events.append((midi, duration_ms))
+        return events
+
+    def send_network_scenario(self, ip: str, port: int, text_data: str) -> None:
+        """Отправка в фоне, чтобы интерфейс не зависал при недоступности сети."""
+        self.rec_status_var.set(f"⏳ Отправка на {ip}:{port}...")
+        
+        def task():
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2.0)
+                sock.connect((ip, port))
+                sock.sendall(text_data.encode('utf-8'))
+                sock.close()
+                self.root.after(0, lambda: self.rec_status_var.set(f"✅ Отправка успешна на {ip}:{port}"))
+            except ConnectionRefusedError:
+                self.root.after(0, lambda: self.rec_status_var.set(f"❌ Приемник на {ip}:{port} не запущен!"))
+            except socket.timeout:
+                self.root.after(0, lambda: self.rec_status_var.set(f"❌ Превышено время ожидания от {ip}:{port}"))
+            except Exception as e:
+                self.root.after(0, lambda: self.rec_status_var.set(f"❌ Ошибка сети: {e}"))
+                
+        threading.Thread(target=task, daemon=True).start()
 
     def convert_to_scenario(self) -> None:
-        """Преобразует список записанных нот в полноценный сценарий команд EMMA (/sn и /bow)."""
+        """Преобразует список записанных нот в полноценный сценарий команд EMMA и сразу отправляет."""
         if not self.recorded_events:
-            messagebox.showinfo("Нет данных", "Сначала запишите исполнение кнопкой '● Старт записи'.")
+            self.rec_status_var.set("ℹ️ Запись остановлена (ноты не обнаружены).")
             return
 
-        # Инициализация сценария с новыми командами подготовки механики
         lines = [
             "Recorded Scenario", 
             "/load_test",
@@ -570,14 +815,12 @@ class StandaloneTunerApp:
             "/bow_p;1.1"
         ]
         
-        # 1. Фильтрация валидных нот и подбор позиций на грифе
         valid_notes = []
         warnings = []
         prev_string = None
         
         for midi_val, duration_ms in self.recorded_events:
             try:
-                # Проверяем, можем ли мы физически сыграть ноту
                 string, position = choose_position(midi_val, prev_string)
                 valid_notes.append((midi_val, duration_ms, string, position))
                 prev_string = string
@@ -585,17 +828,12 @@ class StandaloneTunerApp:
                 warnings.append(midi_to_name(midi_val))
                 
         if not valid_notes:
-            messagebox.showinfo("Пусто", "Нет валидных нот в диапазоне скрипки.")
+            self.rec_status_var.set("ℹ️ Нет валидных нот в диапазоне скрипки.")
             return
 
-        # 2. Интеллектуальное планирование направлений смычка
-        # Подготавливаем список (midi, duration) для алгоритма
         notes_for_planning = [(n[0], n[1]) for n in valid_notes]
-        
-        # Стартуем с X=0.0 (начало смычка) и initial_dir=1 (вниз/вперед). 
         planned_dirs = optimize_bow_directions(notes_for_planning, X_start=0.0, initial_dir=1)
         
-        # 3. Генерация финальных команд
         for idx, (midi_val, duration_ms, string, position) in enumerate(valid_notes):
             speed = speed_for_duration(duration_ms)
             direction = planned_dirs[idx]
@@ -603,25 +841,39 @@ class StandaloneTunerApp:
             lines.append(f"/sn;{string};{position}")
             lines.append(f"/bow;{direction};{duration_ms};{speed}")
 
-        # Отпускаем палец (переход на нулевую позицию) перед завершением программы
         lines.append("/sn;2;0")
-        
         lines.append("/end")
         lines.append("/play")
 
         scenario_text = "\n".join(lines) + "\n"
 
-        self.log_text.delete(1.0, tk.END)
-        self.log_text.insert(1.0, scenario_text)
-        self.log_text.see(1.0)
+        self.commands_text.delete(1.0, tk.END)
+        self.commands_text.insert(1.0, scenario_text)
+        self.commands_text.see(1.0)
 
-        self.rec_status_var.set(f"⚡ Успешно сгенерирован умный сценарий! Сохраните файл в scenarios/")
-        
         if warnings:
-            messagebox.showwarning(
-                "Предупреждение",
-                f"Некоторые ноты ({', '.join(set(warnings))}) выходят за границы скрипки G3-B5 и были пропущены."
-            )
+             print(f"Пропущены ноты вне границ скрипки: {', '.join(set(warnings))}")
+
+        # Отправка по сети
+        target_str = self.network_target_var.get().strip()
+        if ":" in target_str:
+            ip, port_str = target_str.split(":", 1)
+            try:
+                port = int(port_str)
+                self.send_network_scenario(ip, port, scenario_text)
+            except ValueError:
+                 self.rec_status_var.set("❌ Ошибка формата порта")
+        else:
+            self.rec_status_var.set("❌ Сценарий сгенерирован (ошибка формата IP:Port)")
+
+    def audio_callback(self, indata, frames, time_info, status):
+        """Callback for sounddevice stream."""
+        if status:
+            print(status)
+        try:
+            self.audio_queue.put_nowait(indata.copy())
+        except queue.Full:
+            pass
 
     def start_detector(self) -> None:
         if self.running:
@@ -654,6 +906,12 @@ class StandaloneTunerApp:
             except queue.Empty:
                 break
             mono = block[:, 0].astype(np.float32, copy=False)
+
+            # Во время записи копим ВЕСЬ фрагмент целиком — ноты будут разобраны
+            # одним проходом после остановки записи (см. _analyze_recorded_session).
+            if self.is_recording_session:
+                self.session_audio_chunks.append(mono.copy())
+
             if mono.size >= self.ring.size:
                 self.ring[:] = mono[-self.ring.size :]
             else:
@@ -662,24 +920,18 @@ class StandaloneTunerApp:
             processed = True
 
         if self.running and processed and self.detector:
+            # Этот детект — только для живого дисплея тюнера (высота/отклонение в центах).
+            # На сегментацию нот при записи он больше не влияет.
             result = self.detector.detect(self.ring)
             now = time.time()
 
             if result is None:
-                self.silent_ticks += 1
-                if self.silent_ticks >= self.confirm_frames_var.get():
-                    self.live_note_var.set("--")
-                    self.live_hz_var.set("-- Hz")
-                    self.dev_text_var.set("Отклонение: 0 цент.")
-                    self.dev_bar['value'] = 50
+                self.live_note_var.set("--")
+                self.live_hz_var.set("-- Hz")
+                self.dev_text_var.set("Отклонение: 0 цент.")
+                self.dev_bar['value'] = 50
 
-                    if self.is_recording_session:
-                        self._finalize_current_note(now)
-                        self.candidate_midi = None
-                        self.candidate_count = 0
-                        self.pitch_buffer.clear()
-
-                # --- ЛОГИКА АВТО-СТОПА ПО ТИШИНЕ ---
+                # --- ЛОГИКА АВТО-СТОПА ПО ТИШИНЕ (завершает всю сессию записи) ---
                 if self.is_recording_session:
                     if self.silence_start_time is None:
                         self.silence_start_time = now
@@ -692,7 +944,6 @@ class StandaloneTunerApp:
                     if silence_elapsed >= target_silence:
                         self.stop_recording_session(f"Авто-стоп: {target_silence:.1f} сек тишины")
             else:
-                self.silent_ticks = 0
                 self.live_note_var.set(f"{result.note}{result.octave}")
                 self.live_hz_var.set(f"{result.frequency:.2f} Hz")
 
@@ -704,63 +955,15 @@ class StandaloneTunerApp:
                     self.silence_start_time = None
                     self.rec_status_var.set("🔴 ИДЕТ ЗАПИСЬ | Зафиксирован звук...")
 
-                    raw_midi = int(round(69.0 + 12.0 * math.log2(result.frequency / self.detector.a4)))
-
-                    # 1. Медианная фильтрация
-                    self.pitch_buffer.append(raw_midi)
-                    max_buf = self.smoothing_frames_var.get()
-                    if len(self.pitch_buffer) > max_buf:
-                        self.pitch_buffer.pop(0)
-
-                    stable_midi = int(np.median(self.pitch_buffer))
-
-                    # 2. Подтверждение стабильности
-                    if stable_midi == self.candidate_midi:
-                        self.candidate_count += 1
-                    else:
-                        self.candidate_midi = stable_midi
-                        self.candidate_count = 1
-                        self.candidate_start_time = now
-
-                    if self.candidate_count >= self.confirm_frames_var.get():
-                        if self.current_midi != self.candidate_midi:
-                            self._finalize_current_note(self.candidate_start_time)
-                            self.current_midi = self.candidate_midi
-                            self.note_start_time = self.candidate_start_time
-
         self.root.after(50, self.poll_audio)
 
-    def _finalize_current_note(self, end_time: float) -> None:
-        if self.current_midi is not None:
-            duration_ms = int((end_time - self.note_start_time) * 1000)
-            if duration_ms >= self.min_duration_ms_var.get():
-                note_name = midi_to_name(self.current_midi)
-                line = f"Нота: {note_name:<5} | Длительность: {duration_ms} мс\n"
-                self.log_text.insert(tk.END, line)
-                self.log_text.see(tk.END)
-
-                # Сохраняем во внутренний список для генератора сценария
-                self.recorded_events.append((self.current_midi, duration_ms))
-
-            self.current_midi = None
-
     def clear_log(self) -> None:
-        self.log_text.delete(1.0, tk.END)
+        self.notes_text.delete(1.0, tk.END)
+        self.commands_text.delete(1.0, tk.END)
         self.recorded_events.clear()
-
-    def save_to_file(self) -> None:
-        content = self.log_text.get(1.0, tk.END).strip()
-        if not content:
-            messagebox.showinfo("Пусто", "Список нот пуст.")
-            return
-
-        path = filedialog.asksaveasfilename(
-            title="Сохранить записанные ноты или сценарий",
-            defaultextension=".txt",
-            filetypes=(("Текстовые файлы", "*.txt"), ("Все файлы", "*.*"))
-        )
-        if path:
-            Path(path).write_text(content, encoding="utf-8")
+        self.command_history.clear()
+        self.history_index = -1
+        self.manual_cmd_var.set("")
 
     def close(self) -> None:
         self.stop_detector()

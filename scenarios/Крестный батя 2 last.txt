@@ -3,10 +3,11 @@
 
 
 Canon in D 2.0
+/auto_sync;0
 /load_test
 
 /dyn_press;1
-/bow_p;1.1
+/bow_p;1.05
 /lift_to;200
 /mega;/head_rot;left
 /mega;/tilt;mid1

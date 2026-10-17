@@ -1,7 +1,7 @@
 ———————Подмосковные вечера———————
-/load_test
 
-
+/load
+/auto_sync;0
 /dyn_press;1
 /bow_p;1.1
 /lift_to;200

@@ -5,12 +5,10 @@ from __future__ import annotations
 
 import os
 
-# --- ДОБАВЬ ЭТИ ДВЕ СТРОКИ ---
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_HUB_OFFLINE"] = "1"
+# os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# os.environ["HF_HUB_OFFLINE"] = "1"
 
-# Токен Hugging Face для быстрой загрузки моделей
-os.environ["HF_TOKEN"] = "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"
+# os.environ["HF_TOKEN"] = "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"
 
 import argparse
 import re

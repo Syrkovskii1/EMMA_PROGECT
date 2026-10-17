@@ -1,6 +1,7 @@
 -------------Ода к радости------------
 
-/load_test
+/load
+/auto_sync;0
 /sn;2;0
 /dyn_press;1
 /bow_p;1.15
@@ -153,5 +154,5 @@
 /mega;/tilt;forward
 
 /end
-/play
+//play
   

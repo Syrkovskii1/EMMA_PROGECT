@@ -1,5 +1,7 @@
 start
-/load_test
+/load
+/log_mode;3
+/auto_sync;0
 /up_to_play
 /mega;/head_rot;random
 /mega;/tilt;forward
